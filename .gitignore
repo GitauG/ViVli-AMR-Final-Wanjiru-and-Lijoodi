@@ -1,0 +1,19 @@
+# R
+.RData
+.Rhistory
+.Rproj.user
+*.Rproj
+renv/
+renv.lock
+
+# Data
+*.rds
+*.csv
+*.xlsx
+
+# Outputs
+*.png
+*.pdf
+*.html
+*-files/
+

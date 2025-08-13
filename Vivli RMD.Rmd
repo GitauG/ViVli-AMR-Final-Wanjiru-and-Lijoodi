@@ -1,0 +1,1173 @@
+---
+title: "Vivli AMR Kenya Code"
+author: "Gitau George"
+date: "`r Sys.setlocale('LC_TIME', 'en_US.UTF-8'); format(Sys.Date(), '%d %B %Y')`"
+output: html_document
+---
+
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+renv::status()  # Shows which packages are out of sync
+renv::restore() # Installs the versions specified in renv.lock
+```
+
+
+```{r}
+# 1. First install all packages
+required_packages <- c("tidyverse", "readxl", "here", "lme4", "segmented", "scales", 
+                      "performance", "dplyr", "tibble", "broom", "caret", "mice", "pROC", 
+                      "caretEnsemble", "patchwork", "shapr", "vip", "fastshap", "reactable", "htmltools", "reactablefmtr",
+                      "webshot2", "doParallel")
+
+# Install only missing packages
+new_packages <- required_packages[!required_packages %in% installed.packages()[,"Package"]]
+if(length(new_packages)) install.packages(new_packages)
+
+# 2. Load packages with error handling
+suppressPackageStartupMessages({
+  lapply(required_packages, function(pkg) {
+    tryCatch(
+      library(pkg, character.only = TRUE),
+      error = function(e) warning("Package ", pkg, " not available: ", e$message)
+    )
+  })
+})
+```
+
+
+
+```{r}
+###DATA IMPORTATION AND CLEANING
+##Data Importation
+
+# saveRDS(AMR, "AMRdata.rds")  # Only use this after 'AMR' has been created
+
+AMR <- readRDS("AMRdata.rds")  # This assumes the file 'AMRdata.rds' already exists
+structure(AMR)
+```
+
+
+```{r}
+##Filtering Kenyan data for the bacteria of interest
+KenyaAMR <- AMR %>%
+  filter(
+    Country == "Kenya", 
+    Species %in% c(
+      "Escherichia coli",
+      "Klebsiella pneumoniae",
+      "Acinetobacter baumannii",
+      "Staphylococcus aureus",
+      "Streptococcus pneumoniae",
+      "Shigella species",
+      "Salmonella species",
+      "Pseudomonas aeruginosa"
+    )
+  )
+view(KenyaAMR)
+summary(KenyaAMR$Year)
+str(KenyaAMR)
+if (diff(range(KenyaAMR$Year, na.rm = TRUE)) < 10) {
+  warning("Data only covers ", diff(range(KenyaAMR$Year)), " years (expected 20). Analysis may lack long-term trends.")
+}
+##Only data from 2013-2023 - 10 years instead of initially planned 20
+###Removing unnecessary collumn
+structure(KenyaAMR$State)  ##All NA
+KenyaAMR$State <-NULL
+view(KenyaAMR)
+
+```
+
+
+```{r}
+##Checking for any missing data
+anyNA(KenyaAMR)
+which(rowSums(is.na(KenyaAMR)) > 0) ##Most missingness not at random but due to treatment options for various bacteria
+
+library(naniar)
+gg_miss_upset(KenyaAMR)  # Visualize missingness combinations
+
+##Pivoting data to long format
+KenyaAMR2 <- KenyaAMR %>%
+  pivot_longer(
+    cols = ends_with("_I"),
+    names_to = "Antibiotic_name",
+    values_to = "Result"
+  ) %>%
+  mutate(
+    Antibiotic = gsub("_I$", "", Antibiotic_name)  # Clean the column name
+  )
+
+view(KenyaAMR2)
+
+```
+
+
+```{r}
+###Creating a reference table based on species and antibiotics used
+
+bactantibio <- tribble(
+  ~Species,                  ~Antibiotic,
+  "Escherichia coli",         "Amikacin",
+  "Escherichia coli",         "Amoxycillin clavulanate",
+  "Escherichia coli",         "Ampicillin",
+  "Escherichia coli",         "Cefepime",
+  "Escherichia coli",         "Ceftazidime",
+  "Escherichia coli",         "Levofloxacin",
+  "Escherichia coli",         "Meropenem",
+  "Escherichia coli",         "Piperacillin tazobactam",
+  "Klebsiella pneumoniae",    "Amikacin",
+  "Klebsiella pneumoniae",    "Amoxycillin clavulanate",
+  "Klebsiella pneumoniae",    "Ampicillin",
+  "Klebsiella pneumoniae",    "Cefepime",
+  "Klebsiella pneumoniae",    "Ceftazidime",
+  "Klebsiella pneumoniae",    "Levofloxacin",
+  "Klebsiella pneumoniae",    "Meropenem",
+  "Klebsiella pneumoniae",    "Piperacillin tazobactam",
+  "Pseudomonas aeruginosa",   "Amikacin",
+  "Pseudomonas aeruginosa",   "Amoxycillin clavulanate",
+  "Pseudomonas aeruginosa",   "Ampicillin",
+  "Pseudomonas aeruginosa",   "Cefepime",
+  "Pseudomonas aeruginosa",   "Ceftazidime",
+  "Pseudomonas aeruginosa",   "Levofloxacin",
+  "Pseudomonas aeruginosa",   "Meropenem",
+  "Pseudomonas aeruginosa",   "Piperacillin-tazobactam",
+  "Staphylococcus aureus",    "Amikacin",
+  "Staphylococcus aureus",    "Ampicillin",
+  "Staphylococcus aureus",    "Cefepime",
+  "Staphylococcus aureus",    "Ceftazidime",
+  "Staphylococcus aureus",    "Levofloxacin",
+  "Staphylococcus aureus",    "Meropenem",
+  "Staphylococcus aureus",    "Piperacillin tazobactam",
+  "Streptococcus pneumoniae", "Amoxycillin clavulanate",
+  "Streptococcus pneumoniae", "Ceftazidime",
+  "Streptococcus pneumoniae", "Ceftriaxone",
+  "Streptococcus pneumoniae", "Clindamycin",
+  "Streptococcus pneumoniae", "Erythromycin",
+  "Streptococcus pneumoniae", "Levofloxacin",
+  "Streptococcus pneumoniae", "Linezolid",
+  "Streptococcus pneumoniae", "Meropenem",
+  "Streptococcus pneumoniae", "Minocycline",
+  "Streptococcus pneumoniae", "Penicillin",
+  "Acinetobacter baumannii",  "Amikacin",
+  "Acinetobacter baumannii",  "Amoxycillin clavulanate",
+  "Acinetobacter baumannii",  "Ampicillin",
+  "Acinetobacter baumannii",  "Cefepime",
+  "Acinetobacter baumannii",  "Ceftazidime",
+  "Acinetobacter baumannii",  "Levofloxacin",
+  "Acinetobacter baumannii",  "Meropenem",
+  "Acinetobacter baumannii",  "Piperacillin tazobactam"
+)
+
+str(KenyaAMR2)
+```
+
+
+
+```{r}
+###Further Cleaning
+#Checking and harmonising inconsistent names in antibiotics column
+#Ensuring antibiotic values match those in bactantibio
+KenyaAMR2$Antibiotic <- str_replace(KenyaAMR2$Antibiotic, "-", " ")
+
+#Joining the table to df and filtering to only valid organism-antibiotic combinations
+KenyaAMR2 <- KenyaAMR2 %>%
+  inner_join(bactantibio, by = c("Species", "Antibiotic"))
+
+###Checking for any duplicate rows
+duplicated_rows <- KenyaAMR2 %>%
+  group_by(`Isolate Id`, Antibiotic) %>%
+  filter(n() > 1)
+view(duplicated_rows)
+###none
+
+###Checking % missingness
+# Check percentage of missing values per column
+sapply(KenyaAMR2, function(x) mean(is.na(x))) * 100
+
+view(KenyaAMR2)
+str(KenyaAMR2)
+
+###Coding result column to binary
+###Standardise resistance result column and converting to column
+unique(KenyaAMR2$Result)
+KenyaAMR2 <- KenyaAMR2 %>%
+  mutate(
+    Result = str_trim(Result),         # Remove leading/trailing whitespace
+    Result = str_to_title(Result)      # Fix capitalization: "resistant" → "Resistant"
+  )
+KenyaAMR2 <- KenyaAMR2 %>%
+  mutate(
+    Result = str_to_title(trimws(Result)),  # Removes spaces, capitalises
+    Result = ifelse(Result %in% c("Susceptible", "Intermediate", "Resistant"), Result, NA),
+    Result = factor(Result, levels = c("Susceptible", "Intermediate", "Resistant"))
+  )
+KenyaAMR2 <- KenyaAMR2 %>%
+  mutate(
+    Resistant = case_when(
+      Result == "Resistant" ~ 1,
+      Result == "Intermediate" ~ 0.5,
+      Result == "Susceptible" ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+
+unique(KenyaAMR2$Result)
+table(KenyaAMR2$Result, useNA = "always")
+```
+
+```{r}
+####Keeping only unique isolate id, species and antibiotic
+KenyaAMR3 <- KenyaAMR2 %>%
+  filter(!is.na(Result)) %>%
+  distinct(`Isolate Id`, Species, Antibiotic, Result, .keep_all = TRUE)
+
+```
+
+
+
+```{r}
+####Descriptive Statistics
+##Overall Resistance by Species and Antibiotics
+summary_resistance <- KenyaAMR3 %>%
+  count(Species, Antibiotic, Result) %>%
+  group_by(Species, Antibiotic) %>%
+  mutate(Proportion = n / sum(n)) %>%
+  ungroup()
+
+summary_resistance
+
+KenyaIsolateResist <- KenyaAMR3 %>%
+  group_by(`Isolate Id`, Species) %>%
+  summarise(
+    Any_Resistant = any(Result == "Resistant"),
+    .groups = "drop"
+  )
+
+KenyaIsolateResist %>%
+  count(Species, Any_Resistant) %>%
+  group_by(Species) %>%
+  mutate(Proportion = n / sum(n)) %>%
+  ungroup()
+
+summary_resistance %>%
+  ggplot(aes(x = Antibiotic, y = Proportion, fill = Result)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~Species, scales = "free_x") +
+  theme_minimal() +
+  labs(title = "Proportion of Resistance by Species and Antibiotic",
+       y = "Proportion of Isolates", x = "Antibiotic") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+```{r}
+###Summary by Species, Antibiotic, Gender, Age Group
+KenyaAMR3 <- KenyaAMR2 %>%
+  filter(!is.na(Result)) %>%
+  distinct(`Isolate Id`, Species, Antibiotic, Result, .keep_all = TRUE)
+
+IsolateSummary <- KenyaAMR3 %>%
+  group_by(`Isolate Id`, Species, Gender, `Age Group`, `In / Out Patient`, Year) %>%
+  summarise(
+    Num_Tested = sum(!is.na(Resistant)),
+    Num_Resistant = sum(Resistant == 1, na.rm = TRUE),
+    MDR = ifelse(Num_Resistant >= 3, 1, 0),  # Optional
+    Any_Resistant = ifelse(Num_Resistant >= 1, 1, 0),
+    .groups = "drop"
+  )
+
+IsolateSummary
+```
+
+```{r}
+##At Patient Level Per Species
+IsolateSummary %>%
+  group_by(Species, Gender, `Age Group`, `In / Out Patient`) %>%
+  summarise(
+    n = n(),
+    Resistance_Rate = mean(Any_Resistant, na.rm = TRUE),
+    MDR_Rate = mean(MDR, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+```
+
+```{r}
+###Overall Resistance Rates 
+IsolateSummary %>%
+  group_by(Species) %>%
+  summarise(
+    Resistance_Rate = mean(Any_Resistant, na.rm = TRUE),
+    MDR_Rate = mean(MDR, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = reorder(Species, Resistance_Rate), y = Resistance_Rate)) +
+  geom_col(fill = "tomato") +
+  coord_flip() +
+  labs(title = "Overall Resistance Rate by Species (Patient-level)",
+       y = "Resistance Rate", x = "Species") +
+  scale_y_continuous(labels = scales::percent)
+```
+
+
+
+```{r}
+####By Year
+IsolateSummary %>%
+  group_by(Species, Year) %>%
+  summarise(Resistance_Rate = mean(Any_Resistant, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = Year, y = Resistance_Rate, color = Species)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  
+  # Enhanced Y-axis with more breaks and reference lines
+  scale_y_continuous(
+    labels = percent_format(accuracy = 0.1),  # Show decimal places
+    breaks = seq(0, 1, by = 0.1),  # 10% increments
+    minor_breaks = seq(0, 1, by = 0.05),  # 5% minor guides
+    limits = c(0, 1)
+  ) +
+  
+  # Add horizontal reference lines
+  geom_hline(yintercept = seq(0.1, 0.9, by = 0.1), 
+             color = "gray90", 
+             linewidth = 0.3,
+             linetype = "dotted") +
+  
+  # Other plot elements
+  labs(title = "Resistance Trends", y = "Resistance Rate (%)") +
+  theme_minimal() +
+  theme(
+    panel.grid.major.y = element_line(color = "gray85"),
+    panel.grid.minor.y = element_line(color = "gray92")
+  )
+
+```
+
+
+
+```{r}
+###Statistical Testing to Quantify Trends
+# Fit linear models for each species
+trend_models <- IsolateSummary %>%
+  group_by(Species) %>%
+  do(tidy(lm(Any_Resistant ~ Year, data = .))) %>%
+  filter(term == "Year") %>%  # Extract slope coefficients
+  arrange(desc(estimate))
+
+# Display species ranked by annual resistance increase
+trend_summary <- trend_models %>% 
+  dplyr::select(Species, annual_increase = estimate, p.value) %>%
+  mutate(
+    p.signif = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**",
+      p.value < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+trend_summary
+```
+
+
+
+```{r}
+####Small Multiples Plot
+ggplot(IsolateSummary, aes(x = Year, y = Any_Resistant)) +
+  geom_smooth(method = "lm", se = TRUE, color = "firebrick") +  # Trendline with CI
+  geom_point(alpha = 0.6, size = 1) +  # Raw data points
+  facet_wrap(~Species, scales = "free_y", ncol = 3) +  # Separate panels
+  scale_y_continuous(labels = scales::percent, limits = c(0, NA)) +
+  labs(title = "Species-Specific Resistance Trends with Confidence Intervals",
+       subtitle = "Gray bands show 95% confidence intervals for linear trends",
+       y = "Resistance Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r}
+ggplot(trend_summary, aes(x = reorder(Species, annual_increase), y = annual_increase)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = p.signif), vjust = -0.5, size = 4.5, color = "black") +
+  labs(
+    title = "Annual Increase in Resistance by Species",
+    x = "Species",
+    y = "Estimated Annual Increase (Slope from Linear Model)"
+  ) +
+  theme_minimal() +
+  coord_flip() +
+  theme(axis.text.x = element_text(size = 10),
+        axis.title = element_text(size = 12))
+```
+
+
+
+```{r}
+###Breakpoint Analysis
+library(segmented)
+fit <- lm(Any_Resistant ~ Year, data = IsolateSummary)
+seg_fit <- segmented(fit, seg.Z = ~Year, psi = 2017)  # Test breakpoint around 2017
+summary(seg_fit)  # Reports optimal breakpoint year and slope changes
+
+##Breakpoint year = mid 2018 (slope increases by +0.0801 after mid 2018)
+```
+
+```{r}
+###plotting breakpoints
+library(ggplot2)
+
+# Extract breakpoint safely
+break_year <- summary(seg_fit)$psi[1, "Est."]  # Best method
+
+# Plot with correct breakpoint
+ggplot(IsolateSummary, aes(x = Year, y = Any_Resistant)) +
+  geom_line() +
+  geom_vline(
+    xintercept = break_year,
+    linetype = "dashed", 
+    color = "red"
+  ) +
+  annotate(
+    "text", 
+    x = break_year, 
+    y = 0.9, 
+    label = paste("Breakpoint:", round(break_year, 1))  # Shows "2018.6"
+  )
+###Breakpoint = mid 2018
+
+```
+
+
+```{r}
+####Heatmap of Resistance Rates by Year and Species
+IsolateSummary %>%
+  group_by(Species, Year) %>%
+  summarise(Resistance = mean(Any_Resistant), .groups = "drop") %>%
+  ggplot(aes(x = Year, y = Species, fill = Resistance)) +
+  geom_tile(color = "white") +
+  scale_fill_gradientn(
+    colors = c("steelblue", "white", "red"),
+    values = scales::rescale(c(0, 0.5, 1)),
+    labels = scales::percent
+  ) +
+  geom_text(aes(label = paste0(round(100*Resistance), "%")), color = "black", size = 3) +
+  labs(title = "Antimicrobial Resistance Heatmap") +
+  theme_minimal()
+```
+
+
+
+```{r}
+###Statistical Modelling of Resistance Drivers
+# Mixed Effects model accounting for hospital-level variation
+library(lme4)
+
+# Rename the Patient type column 
+IsolateSummary <- KenyaAMR3 %>%
+  filter(!is.na(Result)) %>%
+  distinct(`Isolate Id`, Species, Antibiotic, Result, .keep_all = TRUE) %>%
+  group_by(`Isolate Id`, Species, Gender, `Age Group`, `In / Out Patient`, Year) %>%
+  summarise(
+    Num_Tested = sum(!is.na(Resistant)),
+    Num_Resistant = sum(Resistant == 1, na.rm = TRUE),
+    MDR = ifelse(Num_Resistant >= 3, 1, 0),
+    Any_Resistant = ifelse(Num_Resistant >= 1, 1, 0),
+    .groups = "drop"
+  ) %>%
+  rename(
+    Age_Group = `Age Group`,
+    Patient_Type = `In / Out Patient`
+  )
+
+```
+
+```{r}
+###Visual Assessment of variables
+ggplot(IsolateSummary, aes(x = Age_Group, y = Any_Resistant)) +
+  geom_boxplot() +
+  facet_wrap(~Species)
+```
+```{r}
+ggplot(IsolateSummary, aes(x = Patient_Type, y = Any_Resistant)) +
+  geom_boxplot()
+```
+
+
+
+```{r}
+modelH <- glmer(
+  Any_Resistant ~ Year + Species + (1 | Patient_Type) + Age_Group,
+  data = IsolateSummary,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa")  # Helps with convergence
+)
+
+summary(modelH)  # Shows interaction effects between year and species
+```
+```{r}
+# Calculate resistance rates by species and antibiotic class first
+resistance_summary <- KenyaAMR3 %>%
+  group_by(Species, Antibiotic) %>%
+  summarise(
+    Total_Tested = n(),
+    Resistant = sum(Result == "Resistant", na.rm = TRUE),
+    Resistance_Rate = Resistant / Total_Tested,
+    CI_low = binom.test(Resistant, Total_Tested)$conf.int[1],
+    CI_high = binom.test(Resistant, Total_Tested)$conf.int[2],
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Antibiotic_Class = case_when(
+      Antibiotic %in% c("Meropenem", "Imipenem") ~ "Watch (e.g., Carbapenems)",
+      Antibiotic %in% c("Amikacin", "Gentamicin") ~ "Access (e.g., Aminoglycosides)",
+      str_detect(Antibiotic, "floxacin") ~ "Fluoroquinolones",
+      TRUE ~ "Other"
+    ),
+    Antibiotic_Class = factor(Antibiotic_Class) %>% 
+      fct_relevel("Access (e.g., Aminoglycosides)", "Fluoroquinolones", "Watch (e.g., Carbapenems)")
+  )
+```
+
+
+```{r}
+###Antibiotic Class Resistance Patterns
+# Classify antibiotics by WHO AWaRe categories
+ggplot(resistance_summary, aes(x = Antibiotic_Class, y = Resistance_Rate, fill = Species)) +
+  geom_col(position = position_dodge2(preserve = "single")) +
+  geom_errorbar(aes(ymin = CI_low, ymax = CI_high), 
+                position = position_dodge(width = 0.9), width = 0.25) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 10)) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = "WHO AWaRe Antibiotic Category",
+    y = "Resistance Rate (%)",
+    title = "Antimicrobial Resistance by WHO AWaRe Category"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r}
+####Further Analyses
+###Temporal-Spatial Resistance Hotspots
+#To identify high burden departments 
+KenyaAMR3 %>%
+  group_by(Speciality, Year, Species) %>%
+  summarise(Resistance_Rate = mean(Resistant == 1, na.rm = TRUE)) %>%
+  ggplot(aes(x = Year, y = Speciality, fill = Resistance_Rate)) +
+  geom_tile() +
+  facet_wrap(~Species) +
+  scale_fill_viridis_c(labels = scales::percent)
+```
+```{r}
+###Phenotype-Resistance Correlations
+#to link genotypic markers to resistance
+#Method - Test associations between Phenotype (e.g., carbapenemase genes) and Resistant using Fisher’s exact tests.
+
+KenyaAMR3 %>%
+  filter(Species == "Klebsiella pneumoniae") %>%
+  group_by(Phenotype) %>%
+  summarise(Resistance_Rate = mean(Resistant == 1)) %>%
+  ggplot(aes(x = Phenotype, y = Resistance_Rate)) +
+  geom_col() +
+  labs(title = "Carbapenemase Genes vs. Resistance in K. pneumoniae")
+```
+```{r}
+###Infection Site-Specific Resistance
+##To tailor empiric therapy by infection source
+###stratifying resistance rates by source
+KenyaAMR3 %>%
+  group_by(Species, Source, Antibiotic) %>%
+  summarise(Resistance_Rate = mean(Resistant == 1, na.rm = TRUE)) %>%
+  ggplot(aes(x = Antibiotic, y = Source, fill = Resistance_Rate)) +
+  geom_tile() +
+  facet_wrap(~Species, scales = "free_x")
+```
+```{r}
+####Creating a risk score for MDR to create a clinical flagging tool to flag high-risk isolates 
+##We define MDR as resistance to 3 or more antibiotic classes
+###Using a log regression model scoring risk factors such as inpatient status and age - (To validate)
+# Load required packages
+# Load required packages
+library(dplyr)
+library(broom)
+library(caret)
+library(ggplot2)
+library(mice)
+
+### STEP 1: Define MDR and prepare data
+mdr_data <- KenyaAMR3 %>%
+  # Group and calculate MDR
+  dplyr::group_by(`Isolate Id`) %>%
+  dplyr::summarise(
+    MDR = sum(Resistant == 1) >= 3,
+    .groups = 'drop'
+  ) %>%
+  # Join metadata
+  dplyr::left_join(
+    KenyaAMR3 %>%
+      dplyr::distinct(`Isolate Id`, .keep_all = TRUE) %>%
+      dplyr::select(
+        `Isolate Id`,
+        `Age Group`,
+        Gender,
+        `In / Out Patient`,
+        Source,
+        Speciality
+      ),
+    by = "Isolate Id"
+  ) %>%
+  # Convert data types
+  dplyr::mutate(
+    MDR = factor(MDR, levels = c(FALSE, TRUE), labels = c("No", "Yes")),
+    dplyr::across(c(`Age Group`, Gender, `In / Out Patient`, Source, Speciality), as.factor)
+  )
+
+### STEP 2: Handle missing data with multiple imputation
+set.seed(123)
+imputed_data <- mice(mdr_data, m = 5, maxit = 10, seed = 123,
+                    printFlag = FALSE)
+
+# Create complete dataset (pooled from all imputations)
+complete_data <- complete(imputed_data, "long") 
+complete_data <- complete_data %>%
+  group_by(`Isolate Id`, .imp) %>%  # Take first imputation (or average if needed)
+  filter(.imp==1) %>%
+  ungroup() %>%
+  dplyr::select(-.imp, -.id)
+glimpse(complete_data)
+# ➤ STEP 1b: Drop identifier columns BEFORE modeling
+
+# Retain Isolate Id for reference **but never use it as a predictor**
+
+
+### STEP 3: Build and validate logistic regression model
+set.seed(123)
+
+# Define training control
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = TRUE,
+  sampling = "up"  # Upsamples minority class if needed
+)
+
+# Train model on imputed data
+mdr_model <- train(
+  MDR ~ `Age Group` + Gender + `In / Out Patient` + Source + Speciality,
+  data = complete_data,
+  method = "glm",
+  family = "binomial",
+  trControl = ctrl,
+  metric = "ROC"
+)
+
+###Optimising model
+#Threshold optmisation
+# Find optimal cutoff (default 0.5 may not be best)
+library(pROC)
+
+mdr_scored <- mdr_data %>%
+  mutate(
+    MDR_prob = predict(mdr_model, type = "prob")$Yes,
+    Risk_Level = case_when(
+      MDR_prob >= 0.7 ~ "High",
+      MDR_prob >= 0.3 ~ "Medium",
+      TRUE ~ "Low"
+    )
+  )
+roc_curve <- roc(mdr_scored$MDR, mdr_scored$MDR_prob)
+optimal_thresh <- coords(roc_curve, "best", ret = "threshold")$threshold
+
+# Apply new threshold
+mdr_scored <- mdr_scored %>%
+  mutate(
+    Risk_Level = case_when(
+      MDR_prob >= optimal_thresh ~ "High",
+      MDR_prob >= 0.3 ~ "Medium",
+      TRUE ~ "Low"
+    )
+  )
+
+###Re-running model and checking perfomance
+# Train model on imputed data
+mdr_model <- train(
+  MDR ~ `Age Group` + Gender + `In / Out Patient` + Source + Speciality,
+  data = complete_data,
+  method = "glm",
+  family = "binomial",
+  trControl = ctrl,
+  metric = "ROC"
+)
+
+# Model summary with pooled results across imputations
+final_model <- pool(with(imputed_data, 
+                        glm(MDR ~ `Age Group` + Gender + `In / Out Patient` + 
+                            Source + Speciality, 
+                          family = binomial)))
+
+tidy_results <- broom::tidy(final_model) %>%
+  mutate(
+    odds_ratio = exp(estimate),
+    p.value = format.pval(p.value, digits = 2),
+    term = gsub("`", "", term)  # Clean term names
+  )
+
+
+### STEP 4: Create risk score implementation
+mdr_scored <- complete_data %>%
+  mutate(
+    MDR_prob = predict(mdr_model, newdata = complete_data, type = "prob")$Yes,
+    Risk_Level = cut(MDR_prob,
+                    breaks = c(0, 0.3, 0.7, 1),
+                    labels = c("Low", "Medium", "High")),
+    Risk_Score = round(100 * MDR_prob)  # 0-100 scale for clinical use
+  )
+
+### STEP 5: Visualization and outputs
+
+# 1. Model coefficients plot
+ggplot(tidy_results %>% filter(term != "(Intercept)"), 
+       aes(x = reorder(term, odds_ratio), y = odds_ratio)) +
+  geom_col(fill = "steelblue", width = 0.7) +
+  geom_errorbar(aes(ymin = exp(estimate - 1.96*std.error),
+                   ymax = exp(estimate + 1.96*std.error)),
+               width = 0.2) +
+  geom_text(aes(label = sprintf("OR=%.1f (%.1f-%.1f)", 
+                               odds_ratio,
+                               exp(estimate - 1.96*std.error),
+                               exp(estimate + 1.96*std.error))),
+            hjust = -0.1, size = 3) +
+  coord_flip() +
+  labs(title = "Multidrug Resistance Risk Factors", 
+       subtitle = "Adjusted odds ratios with 95% confidence intervals",
+       x = "", y = "Odds Ratio") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+# 2. Risk distribution by patient type
+ggplot(mdr_scored, aes(x = Risk_Score, fill = Risk_Level)) +
+  geom_histogram(binwidth = 5, alpha = 0.8) +
+  geom_vline(xintercept = c(30, 70), linetype = "dashed", color = "red") +
+  scale_fill_manual(values = c("Low" = "green3", "Medium" = "orange", "High" = "red")) +
+  facet_wrap(~`In / Out Patient`) +
+  labs(title = "MDR Risk Score Distribution by Admission Status",
+       x = "MDR Risk Score (0-100)",
+       y = "Number of Isolates",
+       fill = "Risk Level") +
+  theme_bw(base_size = 12)
+
+# 3. Performance metrics
+conf_mat <- confusionMatrix(
+  data = predict(mdr_model),
+  reference = mdr_scored$MDR,
+  positive = "Yes"
+)
+
+# Print performance metrics
+cat("Model Performance:\n",
+   "AUC:", round(max(mdr_model$results$ROC), 3), "\n",
+   "Sensitivity:", round(conf_mat$byClass["Sensitivity"], 3), "\n",
+   "Specificity:", round(conf_mat$byClass["Specificity"], 3))
+
+### STEP 6: Create clinical flagging tool
+high_risk_isolates <- mdr_scored %>%
+  dplyr::filter(Risk_Level == "High") %>%
+  dplyr::arrange(dplyr::desc(MDR_prob)) %>%
+  dplyr::select(
+    `Isolate Id`,
+    MDR_Probability = MDR_prob,
+    Risk_Score,
+    Risk_Level,
+    Species = Source,
+    `Patient Type` = `In / Out Patient`,
+    Ward = Speciality
+  )
+
+# Output top 10 high-risk isolates
+print("Top 10 High-Risk Isolates:")
+head(high_risk_isolates, 10) %>%
+  knitr::kable(digits = 3)
+
+# Save complete results
+write.csv(mdr_scored, "MDR_Risk_Assessments.csv", row.names = FALSE)
+write.csv(tidy_results, "MDR_Risk_Factors.csv", row.names = FALSE)
+
+```
+
+```{r}
+# Compare multiple models
+library(caretEnsemble)
+methods <- c("glm", "rf", "xgbTree", "glmnet")
+compare_models <- caretList(
+  MDR ~ ., 
+  data = complete_data,
+  trControl = trainControl(method = "cv", number = 5, classProbs = TRUE),
+  methodList = methods,
+  metric = "ROC"
+)
+
+# Show AUC comparison
+resamples(compare_models) %>% summary()
+```
+```{r}
+library(caret)
+library(xgboost)
+
+# 1. Prepare training data (using imputed data) - using Xgboost
+train_data <- complete_data %>% 
+  mutate(MDR = factor(MDR, levels = c("No", "Yes")))  # Ensure proper factor levels
+
+train_data <- train_data %>%
+  dplyr::select(-`Isolate Id`)
+# 2. Set up training control
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = TRUE
+)
+
+# 3. Train XGBoost model
+set.seed(123)
+final_model <- train(
+  MDR ~ .,
+  data = train_data,
+  method = "xgbTree",
+  trControl = ctrl,
+  metric = "ROC",
+  verbose = FALSE
+)
+
+# 4. Verify and save model
+print(final_model)
+saveRDS(final_model, "mdr_xgb_model_verified.rds")
+
+###Saving feature names
+xgb_features <- final_model$finalModel$feature_names
+saveRDS(xgb_features, "model_features.rds")
+```
+
+```{r}
+library(mice)
+library(dplyr)
+
+# 1. Load the saved model
+final_model <- readRDS("mdr_xgb_model_verified.rds")
+
+# 2. Get model features
+model_features <- final_model$finalModel$feature_names
+
+# 3. Prepare imputed data
+completed_data <- lapply(1:5, function(i) {
+  df <- complete(imputed_data, i)
+  
+  # Ensure all features exist
+  missing_features <- setdiff(model_features, names(df))
+  if (length(missing_features) > 0) {
+    df[missing_features] <- 0
+  }
+  
+  # Select and order features
+  df[, model_features, drop = FALSE]
+})
+
+# 4. Generate predictions
+predictions <- lapply(completed_data, function(df) {
+  predict(final_model$finalModel, newdata = as.matrix(df[ , model_features]))
+})
+
+# 5. Create final output
+mdr_predictions <- mdr_data %>%
+  mutate(
+    Prob = rowMeans(do.call(cbind, predictions)),
+    Risk_Level = factor(
+      case_when(
+        Prob > 0.7 ~ "High",
+        Prob > 0.4 ~ "Medium",
+        TRUE ~ "Low"
+      ),
+      levels = c("Low", "Medium", "High"),
+      ordered = TRUE
+    )
+  )
+
+# 6. Save results
+saveRDS(mdr_predictions, "mdr_predictions.rds")
+```
+
+
+```{r}
+###Using clinical plot on full dataset to understand sensitivity/specificity requirements
+library(ggplot2)
+library(patchwork)
+
+# 1. First calculate max count for annotation positioning
+plot_data <- ggplot_build(
+  ggplot(mdr_predictions, aes(x = Prob)) +
+    geom_histogram(binwidth = 0.05)
+)
+max_count <- max(plot_data$data[[1]]$count)
+
+# 2. Create main plot
+main_plot <- ggplot(mdr_predictions, aes(x = Prob)) +
+  geom_histogram(aes(fill = Risk_Level), 
+                 binwidth = 0.05, 
+                 boundary = 0,
+                 color = "white") +
+  geom_vline(xintercept = c(0.4, 0.7), 
+             linetype = "dashed", 
+             linewidth = 1.2,
+             color = c("#FFA500", "#FF0000")) +
+  annotate("text", x = 0.55, y = max_count * 0.9, 
+           label = "REVIEW ZONE", color = "#FFA500", fontface = "bold", size = 5) +
+  annotate("text", x = 0.8, y = max_count * 0.7, 
+           label = "URGENT CASES", color = "#FF0000", fontface = "bold", size = 5) +
+  scale_fill_manual(values = c("Low" = "#2c7bb6", 
+                             "Medium" = "#fdae61", 
+                             "High" = "#d7191c")) +
+  labs(title = "Clinical MDR Risk Distribution",
+       subtitle = paste("Analysis of", nrow(mdr_predictions), "bacterial isolates"),
+       x = "Predicted Multidrug Resistance Probability", 
+       y = "Number of Isolates",
+       fill = "Risk Level") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top",
+        panel.grid.major.x = element_blank())
+
+# 3. Create summary table data
+summary_data <- mdr_predictions %>%
+  group_by(Risk_Level) %>%
+  summarise(
+    Isolates = n(),
+    Avg_Prob = mean(Prob),
+    .groups = "drop"
+  )
+
+# 4. Create table plot
+table_plot <- ggplot(summary_data, aes(x = 1, y = Risk_Level)) +
+  geom_text(aes(label = paste0(Risk_Level, "\n", Isolates, " cases (", 
+                             round(100*Avg_Prob), "%)")),
+            size = 5) +
+  theme_void() +
+  labs(title = "Risk Category Summary") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+# 5. Combine plots
+final_plot <- main_plot + 
+  inset_element(table_plot, 
+               left = 0.6, 
+               bottom = 0.6, 
+               right = 0.95, 
+               top = 0.95)
+
+# 6. Display and save
+print(final_plot)
+ggsave("MDR_Risk_Distribution.png", 
+       final_plot, 
+       width = 12, 
+       height = 8, 
+       dpi = 300)
+```
+```{r}
+###Model Interpretation
+###Global variable importance plot
+library(vip)
+model <- readRDS("mdr_xgb_model_verified.rds")
+vip(model$finalModel)
+```
+
+
+```{r}
+#### ML for resistance prediction to predict resistance using demographics and source
+##Method - Train XGBoost/Random Forest on predictors (species, age group, gender, source, speciality) and outcome (Resistant - binary)
+library(dplyr)
+library(caret)
+library(shapr)    # For model explanations
+library(stringr)# For str_detect()
+library(xgboost)
+# CHUNK 1: Build training matrix and align with model features
+
+# Columns available in your current train_data
+train_predictors <- c("Age Group", "Gender", "In / Out Patient", "Source", "Speciality")
+
+# Select and convert to factor (ensure consistent encoding)
+x_train_df <- train_data %>%
+  dplyr::select(all_of(train_predictors)) %>%
+  mutate(across(everything(), as.factor))
+
+# Create one-hot encoded matrix
+x_train_matrix <- model.matrix(~ . - 1, data = x_train_df) %>% as.matrix()
+
+# Harmonize with model features
+model_features <- model$finalModel$feature_names
+
+# Add missing columns with zeros
+missing_cols <- setdiff(model_features, colnames(x_train_matrix))
+for (col in missing_cols) {
+  x_train_matrix <- cbind(x_train_matrix, setNames(data.frame(rep(0, nrow(x_train_matrix))), col))
+}
+
+# Ensure correct column order
+x_train_matrix <- x_train_matrix[, model_features, drop = FALSE]
+
+```
+
+```{r}
+# CHUNK 2: Wrapper to make predictions with xgboost model
+library(xgboost)
+
+# Create prediction wrapper for fastshap
+pred_wrapper <- function(object, newdata) {
+  newdata <- as.matrix(newdata)
+  predict(object, newdata = newdata)
+}
+```
+
+
+```{r}
+# CHUNK 3: SHAP values
+# CHUNK 3: Compute SHAP values with fastshap
+library(fastshap)
+
+# Sanity check to ensure feature names match
+stopifnot(all(model$finalModel$feature_names %in% colnames(x_train_matrix)))
+
+# Compute SHAP values
+shap_values <- fastshap::explain(
+  object = model$finalModel,
+  X = x_train_matrix,
+  pred_wrapper = pred_wrapper,
+  nsim = 50  # increase for better stability if needed
+)
+
+```
+
+
+```{r}
+library(reactable)
+library(htmltools)
+library(webshot2)
+
+# For first observation
+force_plot <- function(shap_row, features, baseline = mean(predict(model))) {
+  df <- data.frame(
+    feature = names(features),
+    value = as.numeric(features),
+    shap = as.numeric(shap_row)
+  ) %>%
+    arrange(desc(abs(shap)))
+  
+  reactable(
+    df,
+    columns = list(
+      feature = colDef(name = "Feature"),
+      value = colDef(name = "Value"),
+      shap = colDef(
+        name = "SHAP Value",
+        cell = function(value) {
+          color <- ifelse(value > 0, "#ff6b6b", "#4ecdc4")
+          div(style = list(background = color, padding = "5px"), 
+              round(value, 4))
+        }
+      )
+    ),
+    fullWidth = FALSE
+  )
+}
+
+
+force_plot<-force_plot(shap_values[1, ], x_train_matrix[1, ])
+force_plot
+
+htmlwidgets::saveWidget(
+  widget = force_plot,
+  file = "shap_force_plot.html",
+  title = "SHAP Force Plot",
+  selfcontained = TRUE
+)
+if(requireNamespace("webshot2", quietly = TRUE))
+  # Create properly scoped temp file
+  tmp_html <- tempfile(fileext = ".html")
+ htmlwidgets::saveWidget(force_plot, tmp_html)
+
+  
+webshot2::webshot(
+  url = tmp_html,
+  file = "shap_force_plot.png",
+  delay = 2,       # Give time for rendering
+  zoom = 2,        # Higher resolution
+  selector = ".reactable"  # Target specific element
+)
+```
+
+```{r}
+###Stewardship prioritisation
+##Ranking antibiotics by resistance risk
+stewardship_priority <- KenyaAMR3 %>%
+  group_by(Antibiotic) %>%
+  summarise(
+    Resistance_Rate = mean(Resistant, na.rm = TRUE),  # Handles missing values
+    Total_Isolates = n()  # Added sample size for context
+  ) %>%
+  mutate(
+    # Prioritize antibiotics with both high resistance AND sufficient data
+    Priority_Score = Resistance_Rate * sqrt(Total_Isolates)  # Weight by sample size
+  ) %>%
+  arrange(desc(Priority_Score)) %>%
+  # Add resistance category flags
+  mutate(
+    Resistance_Category = case_when(
+      Resistance_Rate >= 0.5 ~ "High (≥50%)",
+      Resistance_Rate >= 0.3 ~ "Moderate (30-49%)",
+      TRUE ~ "Low (<30%)"
+    )
+  )
+```
+
+```{r}
+###Stewardhsip priority visualisation
+library(ggplot2)
+
+ggplot(stewardship_priority, 
+       aes(x = reorder(Antibiotic, Priority_Score), 
+           y = Resistance_Rate, 
+           fill = Resistance_Category)) +
+  geom_col(width = 0.7) +  # Columns with adjusted width
+  geom_text(
+    aes(label = paste0(round(100*Resistance_Rate), "% (n=", Total_Isolates, ")")), 
+    hjust = -0.1,          # Right-align text
+    size = 3,              # Smaller text size
+    color = "black"        # Ensure readability
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),  # Whole percentages
+    limits = c(0, 1.1),    # Extra space for labels
+    expand = c(0, 0)       # Remove padding
+  ) +
+  scale_fill_manual(
+    values = c("High (≥50%)" = "#e6550d", 
+               "Moderate (30-49%)" = "#fdae6b", 
+               "Low (<30%)" = "#fee6ce")
+  ) +
+  labs(
+    title = "Antibiotic Resistance Prioritization",
+    subtitle = "Sorted by resistance prevalence weighted by sample size",
+    x = NULL,
+    y = "Resistance Rate",
+    fill = "Resistance Level"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    legend.position = "top"
+  )
+```
+
